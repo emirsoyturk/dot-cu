@@ -1,23 +1,20 @@
-#define WIDTH 1920
-#define HEIGHT 1920
-#define BLOCK_SIZE 32
-#define BACKGROUND_COLOR_X 160
+#define WIDTH 1024
+#define HEIGHT 1024
+#define BLOCK_SIZE 16
+#define BACKGROUND_COLOR_X 10
 #define BACKGROUND_COLOR_Y 10
-#define BACKGROUND_COLOR_Z 40
+#define BACKGROUND_COLOR_Z 10
 
 #include <iostream>
 #include <cuda_runtime.h>
 #include "raytracer.h"
 #include <opencv2/opencv.hpp>
+#include <fstream>
+#include <vector>
+#include <sstream>
 
 __device__ float dot(const float3& a, const float3& b) {
     return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-__device__ void swap(float& a, float& b) {
-    float temp = a;
-    a = b;
-    b = temp;
 }
 
 __device__ float3 operator-(const float3& a, const float3& b) {
@@ -27,6 +24,32 @@ __device__ float3 operator-(const float3& a, const float3& b) {
 __device__ float3 operator+(const float3& a, const float3& b) {
     return make_float3(a.x + b.x, a.y + b.y, a.z + b.z);
 }
+
+__device__ float3 operator*(const float3& a, const float3& b) {
+    return make_float3(a.x * b.x, a.y * b.y, a.z * b.z);
+}
+
+__device__ float3 operator*(const float3& a, const float& b) {
+    return make_float3(a.x * b, a.y * b, a.z * b);
+}
+
+__device__ float3 operator*(const float& a, const float3& b) {
+    return make_float3(a * b.x, a * b.y, a * b.z);
+}
+
+__device__ float3 normalize(const float3& a) {
+    float len = sqrt(a.x * a.x + a.y * a.y + a.z * a.z);
+    return make_float3(a.x / len, a.y / len, a.z / len);
+}
+
+__device__ float3 reflect(const float3& I, const float3& N) {
+    return I - 2 * dot(N, I) * N;
+}
+
+__device__ float3 operator-(const float3& a) {
+    return make_float3(-a.x, -a.y, -a.z);
+}
+
 
 __device__ bool intersect_sphere(const Sphere& sphere, const Ray& ray, float& t) {
     float3 oc = make_float3(ray.origin.x - sphere.center.x, ray.origin.y - sphere.center.y, ray.origin.z - sphere.center.z);
@@ -42,144 +65,173 @@ __device__ bool intersect_sphere(const Sphere& sphere, const Ray& ray, float& t)
     }
 }
 
-__device__ bool intersect_cube(Cube& cube, Ray& ray, float& t) {
-    float3 min = cube.center - make_float3(cube.size.x / 2.0f, cube.size.y / 2.0f, cube.size.z / 2.0f);
-    float3 max = cube.center + make_float3(cube.size.x / 2.0f, cube.size.y / 2.0f, cube.size.z / 2.0f);
+__device__ float3 compute_lighting(const Ray& ray, const Sphere& sphere, const float3& hit_point, const Light* lights, int num_lights) {
+    float3 diffuse_color = make_float3(0.0f, 0.0f, 0.0f);
 
-    float tmin = (min.x - ray.origin.x) / ray.direction.x;
-    float tmax = (max.x - ray.origin.x) / ray.direction.x;
+    float3 normal = normalize(hit_point - sphere.center);
+    float3 view_dir = normalize(ray.origin - hit_point);
 
-    if (tmin > tmax) {
-      swap(tmin, tmax);
+    for (int i = 0; i < num_lights; ++i) {
+        const Light& light = lights[i];
+        float3 light_dir = normalize(light.position - hit_point);
+        float diff = fmaxf(dot(normal, light_dir), 0.0f);
+        diffuse_color = diffuse_color + (diff * light.color * sphere.color);
     }
 
-    float tymin = (min.y - ray.origin.y) / ray.direction.y;
-    float tymax = (max.y - ray.origin.y) / ray.direction.y;
+    float3 color = diffuse_color;
 
-    if (tymin > tymax) {
-      swap(tymin, tymax);
-    }
+    color.x = fminf(fmaxf(color.x, 0.0f), 1.0f);
+    color.y = fminf(fmaxf(color.y, 0.0f), 1.0f);
+    color.z = fminf(fmaxf(color.z, 0.0f), 1.0f);
 
-    if ((tmin > tymax) || (tymin > tmax)) {
-        return false;
-    }
-
-    if (tymin > tmin) {
-        tmin = tymin;
-    }
-
-    if (tymax < tmax) {
-        tmax = tymax;
-    }
-
-    float tzmin = (min.z - ray.origin.z) / ray.direction.z;
-    float tzmax = (max.z - ray.origin.z) / ray.direction.z;
-
-    if (tzmin > tzmax) {
-      swap(tzmin, tzmax);
-    }
-
-    if ((tmin > tzmax) || (tzmin > tmax)) {
-        return false;
-    }
-
-    if (tzmin > tmin) {
-        tmin = tzmin;
-    }
-
-    if (tzmax < tmax) {
-        tmax = tzmax;
-    }
-
-    t = tmin;
-
-    if (t < 0) {
-        t = tmax;
-        if (t < 0) {
-            return false;
-        }
-    }
-
-    return true;
+    return color;
 }
 
-__global__ void kernel(unsigned char* d_output, Sphere* spheres, int num_spheres, Cube* cubes, int num_cubes) {
+__device__ float3 trace_ray(const Ray& ray, Sphere* spheres, int num_spheres, Light* lights, int num_lights, int MAX_DEPTH) {
+    float3 color = make_float3(BACKGROUND_COLOR_X / 255.0f, BACKGROUND_COLOR_Y / 255.0f, BACKGROUND_COLOR_Z / 255.0f);
+    Ray current_ray = ray;
+    int depth = 0;
+
+    float current_reflectance = 1.0f;
+
+    while (depth < MAX_DEPTH) {
+        float t;
+        float3 hit_point, normal;
+        int hit_index = -1;
+        float closest_t = FLT_MAX;
+
+        for (int i = 0; i < num_spheres; i++) {
+            if (intersect_sphere(spheres[i], current_ray, t) && t < closest_t) {
+                closest_t = t;
+                hit_index = i;
+            }
+        }
+
+        if (hit_index == -1) {
+            color = make_float3(BACKGROUND_COLOR_X / 255.0f, BACKGROUND_COLOR_Y / 255.0f, BACKGROUND_COLOR_Z / 255.0f);
+            break;
+        }
+
+        hit_point = current_ray.origin + closest_t * current_ray.direction;
+        normal = normalize(hit_point - spheres[hit_index].center);
+        color = compute_lighting(current_ray, spheres[hit_index], hit_point, lights, num_lights);
+        
+        if (spheres[hit_index].reflectivity > 0 && depth < MAX_DEPTH) {
+            float3 reflection_dir = reflect(current_ray.direction, normal);
+            reflection_dir = normalize(reflection_dir);
+
+            Ray reflected_ray;
+            reflected_ray.origin = hit_point + 0.001f * normal;
+            reflected_ray.direction = reflection_dir;
+
+            float3 reflection_color = trace_ray(reflected_ray, spheres, num_spheres, lights, num_lights, MAX_DEPTH - 1);
+            color = (1.0f - spheres[hit_index].reflectivity * current_reflectance) * color + spheres[hit_index].reflectivity * current_reflectance * reflection_color;
+        } else {
+            color = make_float3(BACKGROUND_COLOR_X / 255.0f, BACKGROUND_COLOR_Y / 255.0f, BACKGROUND_COLOR_Z / 255.0f);
+            break;
+        }
+        // current_reflectance *= spheres[hit_index].reflectivity;
+        depth++;
+    }
+
+    color.x = fminf(fmaxf(color.x, 0.0f), 1.0f);
+    color.y = fminf(fmaxf(color.y, 0.0f), 1.0f);
+    color.z = fminf(fmaxf(color.z, 0.0f), 1.0f);
+
+    return color;
+}
+
+
+__global__
+void kernel(unsigned char* d_output, Sphere* spheres, int num_spheres, Light* lights, int num_lights, int max_depth) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x >= WIDTH || y >= HEIGHT) {
-      return;
-    }
+    if (x >= WIDTH || y >= HEIGHT) return;
 
     int index = (y * WIDTH + x) * 3;
 
     float3 origin = make_float3(0.0f, 0.0f, 0.0f);
-    float3 direction = make_float3(
+    float3 direction = normalize(make_float3(
         (x - WIDTH / 2) / (float)WIDTH,
         (y - HEIGHT / 2) / (float)HEIGHT,
         -1.0f
-    );
+    ));
 
-    Ray ray = {origin, direction};
+    Ray ray = { origin, direction };
+    float3 color = trace_ray(ray, spheres, num_spheres, lights, num_lights, max_depth);
 
-    float t;
-    bool hit = false;
-    float3 color = make_float3(0.0f, 0.0f, 0.0f);
-
-    for (int i = 0; i < num_spheres; i++) {
-        if (intersect_sphere(spheres[i], ray, t)) {
-            color = spheres[i].color;
-            hit = true;
-        }
-    }
-
-    for (int i = 0; i < num_cubes; i++) {
-        if (intersect_cube(cubes[i], ray, t)) {
-            color = cubes[i].color;
-            hit = true;
-        }
-    }
-
-    if (hit) {
-        d_output[index] = (unsigned char)(color.x * 255);
-        d_output[index + 1] = (unsigned char)(color.y * 255);
-        d_output[index + 2] = (unsigned char)(color.z * 255);
-    } else {
-        d_output[index] = BACKGROUND_COLOR_X;
-        d_output[index + 1] = BACKGROUND_COLOR_Y;
-        d_output[index + 2] = BACKGROUND_COLOR_Z;
-    }
+    d_output[index] = (unsigned char)(color.x * 255);
+    d_output[index + 1] = (unsigned char)(color.y * 255);
+    d_output[index + 2] = (unsigned char)(color.z * 255);
 }
 
 void raytrace() {
+    int max_depth;
+
     std::cout << "Ray tracing started!" << std::endl;
 
-    int imageSize = WIDTH * HEIGHT * 3;
-    unsigned char *image = new unsigned char[imageSize];
+    std::vector<SphereData> spheres;
+    std::vector<LightData> lights;
 
-    unsigned char *d_output;
+    std::ifstream scene_file("scene.txt");
+    if (!scene_file.is_open()) {
+        std::cerr << "Failed to open scene file." << std::endl;
+        return;
+    }
+
+    std::string line;
+    bool reading_spheres = false;
+    bool reading_lights = false;
+
+    while (std::getline(scene_file, line)) {
+        if (line.empty() || line[0] == '#') {
+            if (line.find("# MAX_DEPTH") != std::string::npos) {
+                std::getline(scene_file, line);
+                max_depth = std::stoi(line);
+            } else if (line.find("# Spheres") != std::string::npos) {
+                reading_spheres = true;
+                reading_lights = false;
+            } else if (line.find("# Lights") != std::string::npos) {
+                reading_lights = true;
+                reading_spheres = false;
+            }
+            continue;
+        }
+
+        std::istringstream iss(line);
+        if (reading_spheres) {
+            SphereData sphere;
+            iss >> sphere.center.x >> sphere.center.y >> sphere.center.z;
+            iss >> sphere.radius;
+            iss >> sphere.color.x >> sphere.color.y >> sphere.color.z;
+            iss >> sphere.reflectivity;
+            spheres.push_back(sphere);
+        } else if (reading_lights) {
+            LightData light;
+            iss >> light.position.x >> light.position.y >> light.position.z;
+            iss >> light.color.x >> light.color.y >> light.color.z;
+            lights.push_back(light);
+        }
+    }
+
+    scene_file.close();
+
+    int imageSize = WIDTH * HEIGHT * 3;
+    unsigned char* image = new unsigned char[imageSize];
+
+    unsigned char* d_output;
     cudaMalloc(&d_output, imageSize);
 
-    Sphere h_spheres[] = {
-        {make_float3(100.0f / WIDTH, 0.0f / HEIGHT, -1.0f), 0.2f, make_float3(0.3f, 0.4f, 0.0f)},
-        {make_float3(1.0f / WIDTH, 0.0f / HEIGHT, -2.0f), 0.2f, make_float3(0.6f, 0.2f, 0.1f)}
-    };
-
-    Cube h_cubes[] = {
-        {make_float3(-500.0f / WIDTH, -500.0f / HEIGHT, -1.0f), make_float3(0.4f, 0.2f, 0.2f), make_float3(0.3f, 0.4f, 0.0f)},
-        {make_float3(500.0f / WIDTH, 100.0f / HEIGHT, -2.0f), make_float3(0.2f, 0.2f, 0.2f), make_float3(0.1f, 0.2f, 0.8f)}
-    };
-
-    int num_spheres = sizeof(h_spheres) / sizeof(Sphere);
-    int num_cubes = sizeof(h_cubes) / sizeof(Cube);
-
-    Sphere *d_spheres;
+    int num_spheres = spheres.size();
+    Sphere* d_spheres;
     cudaMalloc(&d_spheres, num_spheres * sizeof(Sphere));
-    cudaMemcpy(d_spheres, h_spheres, num_spheres * sizeof(Sphere), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_spheres, spheres.data(), num_spheres * sizeof(Sphere), cudaMemcpyHostToDevice);
 
-    Cube *d_cubes;
-    cudaMalloc(&d_cubes, num_cubes * sizeof(Cube));
-    cudaMemcpy(d_cubes, h_cubes, num_cubes * sizeof(Cube), cudaMemcpyHostToDevice);
+    int num_lights = lights.size();
+    Light* d_lights;
+    cudaMalloc(&d_lights, num_lights * sizeof(Light));
+    cudaMemcpy(d_lights, lights.data(), num_lights * sizeof(Light), cudaMemcpyHostToDevice);
 
     dim3 blockSize(BLOCK_SIZE, BLOCK_SIZE);
     dim3 gridSize(
@@ -187,17 +239,23 @@ void raytrace() {
       (HEIGHT + blockSize.y - 1) / blockSize.y
     );
 
-    kernel<<<gridSize, blockSize>>>(d_output, d_spheres, num_spheres, d_cubes, num_cubes);
+    kernel<<<gridSize, blockSize>>>(d_output, d_spheres, num_spheres, d_lights, num_lights, max_depth);
     cudaDeviceSynchronize();
 
     cudaMemcpy(image, d_output, imageSize, cudaMemcpyDeviceToHost);
 
     cv::Mat output(HEIGHT, WIDTH, CV_8UC3, image);
-    cv::imwrite("output.jpg", output);
+    cv::imwrite("scene.jpg", output);
+
+    for (int i = 0; i < 3; i++) {
+        std::cout << (int)image[i] << " ";
+    }
+    std::cout << std::endl;
 
     delete[] image;
     cudaFree(d_output);
     cudaFree(d_spheres);
+    cudaFree(d_lights);
 
-    std::cout << "Ray tracing completed! Image saved as output.ppm" << std::endl;
+    std::cout << "Ray tracing completed! Image saved as scene.jpg" << std::endl;
 }

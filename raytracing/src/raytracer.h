@@ -5,6 +5,7 @@ struct Sphere {
     float3 center;
     float radius;
     float3 color;
+    float reflectivity;
 };
 
 struct Cube {
@@ -19,6 +20,18 @@ struct Ray {
 };
 
 struct Light {
+    float3 position;
+    float3 color;
+};
+
+struct SphereData {
+    float3 center;
+    float radius;
+    float3 color;
+    float reflectivity;
+};
+
+struct LightData {
     float3 position;
     float3 color;
 };
