@@ -22,6 +22,7 @@ struct Ray {
 struct Light {
     float3 position;
     float3 color;
+    float intensity;
 };
 
 struct SphereData {
@@ -34,6 +35,7 @@ struct SphereData {
 struct LightData {
     float3 position;
     float3 color;
+    float intensity;
 };
 
 __device__ bool intersect_sphere(const Sphere& sphere, const Ray& ray, float& t);

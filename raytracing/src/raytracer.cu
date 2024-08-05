@@ -75,7 +75,7 @@ __device__ float3 compute_lighting(const Ray& ray, const Sphere& sphere, const f
         const Light& light = lights[i];
         float3 light_dir = normalize(light.position - hit_point);
         float diff = fmaxf(dot(normal, light_dir), 0.0f);
-        diffuse_color = diffuse_color + (diff * light.color * sphere.color);
+        diffuse_color = diffuse_color + (diff * light.color * sphere.color * light.intensity);
     }
 
     float3 color = diffuse_color;
@@ -115,14 +115,13 @@ __device__ float3 trace_ray(const Ray& ray, Sphere* spheres, int num_spheres, Li
         hit_point = current_ray.origin + closest_t * current_ray.direction;
         normal = normalize(hit_point - spheres[hit_index].center);
         color = compute_lighting(current_ray, spheres[hit_index], hit_point, lights, num_lights);
-        
+
         if (spheres[hit_index].reflectivity > 0 && depth < MAX_DEPTH) {
             float3 reflection_dir = reflect(current_ray.direction, normal);
-            reflection_dir = normalize(reflection_dir);
 
             Ray reflected_ray;
             reflected_ray.origin = hit_point + 0.001f * normal;
-            reflected_ray.direction = reflection_dir;
+            reflected_ray.direction = -reflection_dir;
 
             float3 reflection_color = trace_ray(reflected_ray, spheres, num_spheres, lights, num_lights, MAX_DEPTH - 1);
             color = (1.0f - spheres[hit_index].reflectivity * current_reflectance) * color + spheres[hit_index].reflectivity * current_reflectance * reflection_color;
@@ -166,57 +165,7 @@ void kernel(unsigned char* d_output, Sphere* spheres, int num_spheres, Light* li
     d_output[index + 2] = (unsigned char)(color.z * 255);
 }
 
-void raytrace() {
-    int max_depth;
-
-    std::cout << "Ray tracing started!" << std::endl;
-
-    std::vector<SphereData> spheres;
-    std::vector<LightData> lights;
-
-    std::ifstream scene_file("scene.txt");
-    if (!scene_file.is_open()) {
-        std::cerr << "Failed to open scene file." << std::endl;
-        return;
-    }
-
-    std::string line;
-    bool reading_spheres = false;
-    bool reading_lights = false;
-
-    while (std::getline(scene_file, line)) {
-        if (line.empty() || line[0] == '#') {
-            if (line.find("# MAX_DEPTH") != std::string::npos) {
-                std::getline(scene_file, line);
-                max_depth = std::stoi(line);
-            } else if (line.find("# Spheres") != std::string::npos) {
-                reading_spheres = true;
-                reading_lights = false;
-            } else if (line.find("# Lights") != std::string::npos) {
-                reading_lights = true;
-                reading_spheres = false;
-            }
-            continue;
-        }
-
-        std::istringstream iss(line);
-        if (reading_spheres) {
-            SphereData sphere;
-            iss >> sphere.center.x >> sphere.center.y >> sphere.center.z;
-            iss >> sphere.radius;
-            iss >> sphere.color.x >> sphere.color.y >> sphere.color.z;
-            iss >> sphere.reflectivity;
-            spheres.push_back(sphere);
-        } else if (reading_lights) {
-            LightData light;
-            iss >> light.position.x >> light.position.y >> light.position.z;
-            iss >> light.color.x >> light.color.y >> light.color.z;
-            lights.push_back(light);
-        }
-    }
-
-    scene_file.close();
-
+void render_frame(const std::vector<SphereData>& spheres, const std::vector<LightData>& lights, int max_depth, int frame_number) {
     int imageSize = WIDTH * HEIGHT * 3;
     unsigned char* image = new unsigned char[imageSize];
 
@@ -245,17 +194,77 @@ void raytrace() {
     cudaMemcpy(image, d_output, imageSize, cudaMemcpyDeviceToHost);
 
     cv::Mat output(HEIGHT, WIDTH, CV_8UC3, image);
-    cv::imwrite("scene.jpg", output);
-
-    for (int i = 0; i < 3; i++) {
-        std::cout << (int)image[i] << " ";
-    }
-    std::cout << std::endl;
+    std::string filename = "frames/output_" + std::to_string(frame_number) + ".jpg";
+    cv::imwrite(filename, output);
 
     delete[] image;
     cudaFree(d_output);
     cudaFree(d_spheres);
     cudaFree(d_lights);
+}
 
-    std::cout << "Ray tracing completed! Image saved as scene.jpg" << std::endl;
+void raytrace() {
+    int max_depth;
+    std::cout << "Ray tracing started!" << std::endl;
+
+    std::ifstream scene_file("scene.txt");
+    if (!scene_file.is_open()) {
+        std::cerr << "Failed to open scene file." << std::endl;
+        return;
+    }
+
+    std::string line;
+    bool reading_frame = false;
+    bool reading_spheres = false;
+    bool reading_lights = false;
+    int frame_number = 0;
+    std::vector<SphereData> spheres;
+    std::vector<LightData> lights;
+
+    while (std::getline(scene_file, line)) {
+        if (line.empty() || line[0] == '#') {
+            if (line.find("# Frame") != std::string::npos) {
+                if (reading_frame) {
+                    render_frame(spheres, lights, max_depth, frame_number);
+                    frame_number++;
+                    spheres.clear();
+                    lights.clear();
+                }
+                reading_frame = true;
+            } else if (line.find("# MAX_DEPTH") != std::string::npos) {
+                std::getline(scene_file, line);
+                max_depth = std::stoi(line);
+            } else if (line.find("# Spheres") != std::string::npos) {
+                reading_spheres = true;
+                reading_lights = false;
+            } else if (line.find("# Lights") != std::string::npos) {
+                reading_lights = true;
+                reading_spheres = false;
+            }
+            continue;
+        }
+
+        std::istringstream iss(line);
+        if (reading_spheres) {
+            SphereData sphere;
+            iss >> sphere.center.x >> sphere.center.y >> sphere.center.z;
+            iss >> sphere.radius;
+            iss >> sphere.color.x >> sphere.color.y >> sphere.color.z;
+            iss >> sphere.reflectivity;
+            spheres.push_back(sphere);
+        } else if (reading_lights) {
+            LightData light;
+            iss >> light.position.x >> light.position.y >> light.position.z;
+            iss >> light.color.x >> light.color.y >> light.color.z;
+            iss >> light.intensity;
+            lights.push_back(light);
+        }
+    }
+
+    if (reading_frame) {
+        render_frame(spheres, lights, max_depth, frame_number);
+    }
+
+    scene_file.close();
+    std::cout << "Ray tracing completed! Frames saved in the 'frames' directory." << std::endl;
 }
